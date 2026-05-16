@@ -9,7 +9,7 @@
 <br>
 
 <div align="center">
-  <img src="preview image.png" alt="Omni-Copilot AI Extension Preview" style="max-width: 100%; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);">
+  <img src="image.png" alt="Omni-Copilot AI Extension Preview" style="max-width: 100%; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);">
 </div>
 
 ## 🚀 Overview
