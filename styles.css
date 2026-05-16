@@ -356,3 +356,39 @@ details[open] .thinking-summary {
   line-height: 1.6;
   border-top: 0;
 }
+
+/* Scroll to bottom button */
+.scroll-bottom-btn {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(11, 17, 32, 0.85);
+  backdrop-filter: blur(4px);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 20;
+  transition: all 0.2s ease;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+.scroll-bottom-btn:hover {
+  background: var(--accent-color);
+  color: #0b1120;
+  border-color: var(--accent-color);
+}
+.scroll-bottom-btn.hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 10px);
+}
+#system-prompt-input {
+  resize: vertical;
+  min-height: 40px;
+}

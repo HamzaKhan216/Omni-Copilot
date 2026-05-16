@@ -15,7 +15,9 @@ document.addEventListener('DOMContentLoaded', () => {
     historyBtn: document.getElementById('history-btn'),
     historyPanel: document.getElementById('history-panel'),
     historyList: document.getElementById('history-list'),
-    newChatBtn: document.getElementById('new-chat-btn')
+    newChatBtn: document.getElementById('new-chat-btn'),
+    systemPromptInput: document.getElementById('system-prompt-input'),
+    scrollBottomBtn: document.getElementById('scroll-bottom-btn')
   };
 
   let currentSessionId = null;
@@ -29,10 +31,11 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   // Load Settings
-  chrome.storage.local.get(['provider', 'model', 'apiKey'], (data) => {
+  chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt'], (data) => {
     if (data.provider) elements.providerSelect.value = data.provider;
     if (data.model) elements.modelInput.value = data.model;
     if (data.apiKey) elements.apikeyInput.value = data.apiKey;
+    if (data.systemPrompt) elements.systemPromptInput.value = data.systemPrompt;
     elements.modelInput.placeholder = `e.g. ${defaultModels[elements.providerSelect.value]}`;
   });
 
@@ -136,7 +139,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const provider = elements.providerSelect.value;
     const model = elements.modelInput.value.trim() || defaultModels[provider];
     const apiKey = elements.apikeyInput.value.trim();
-    chrome.storage.local.set({ provider, model, apiKey }, () => {
+    const systemPrompt = elements.systemPromptInput.value.trim();
+    chrome.storage.local.set({ provider, model, apiKey, systemPrompt }, () => {
       elements.settingsPanel.classList.remove('open');
       appendMessage('System', 'Settings saved successfully!', 'system-msg', false);
     });
@@ -157,6 +161,19 @@ document.addEventListener('DOMContentLoaded', () => {
   elements.promptInput.addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = (this.scrollHeight < 120 ? this.scrollHeight : 120) + 'px';
+  });
+
+  elements.chatContainer.addEventListener('scroll', () => {
+    const isAtBottom = elements.chatContainer.scrollHeight - elements.chatContainer.scrollTop <= elements.chatContainer.clientHeight + 20;
+    if (isAtBottom) {
+      elements.scrollBottomBtn.classList.add('hidden');
+    } else {
+      elements.scrollBottomBtn.classList.remove('hidden');
+    }
+  });
+
+  elements.scrollBottomBtn.addEventListener('click', () => {
+    elements.chatContainer.scrollTo({ top: elements.chatContainer.scrollHeight, behavior: 'smooth' });
   });
 
   // Start a new session by default on load
@@ -230,7 +247,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const typingIndicatorHTML = `<div class="typing-indicator"><span></span><span></span><span></span></div>`;
     const aiMessageDiv = appendMessage('AI', typingIndicatorHTML, 'ai-message', true);
 
-    chrome.storage.local.get(['provider', 'model', 'apiKey'], async (settings) => {
+    chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt'], async (settings) => {
       if (!settings.apiKey) {
         aiMessageDiv.innerHTML = '⚠️ Please set your API key in Settings first.';
         elements.settingsPanel.classList.add('open');
@@ -250,7 +267,7 @@ document.addEventListener('DOMContentLoaded', () => {
       try {
         const response = await fetchAIResponse(
           settings.provider, settings.model || defaultModels[settings.provider],
-          settings.apiKey, chatHistory, imagesToSend
+          settings.apiKey, chatHistory, imagesToSend, settings.systemPrompt
         );
 
         aiMessageDiv.innerHTML = parseMarkdown(response);
@@ -401,16 +418,26 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function getPageContext() {
-    const[tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab || tab.url.startsWith('chrome://')) return "";
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: () => document.body.innerText.substring(0, 10000)
+      func: () => {
+        const selection = window.getSelection().toString().trim();
+        if (selection) return selection;
+        
+        const clone = document.body.cloneNode(true);
+        const noisyTags = ['script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript', 'iframe', 'svg'];
+        noisyTags.forEach(tag => {
+          clone.querySelectorAll(tag).forEach(el => el.remove());
+        });
+        return clone.innerText.replace(/\n\s*\n/g, '\n').substring(0, 15000);
+      }
     });
     return result || "";
   }
 
-  async function fetchAIResponse(provider, model, apiKey, messages, pendingImages = []) {
+  async function fetchAIResponse(provider, model, apiKey, messages, pendingImages = [], customSystemPrompt = "") {
     let url, headers, body;
 
     if (['openai', 'groq', 'nvidia'].includes(provider)) {
@@ -430,10 +457,14 @@ document.addEventListener('DOMContentLoaded', () => {
         return m;
       });
 
+      if (customSystemPrompt) {
+        formattedMessages.unshift({ role: "system", content: customSystemPrompt });
+      }
+
       body = JSON.stringify({ model, messages: formattedMessages });
     } else if (provider === 'claude') {
       url = "https://api.anthropic.com/v1/messages"; headers = { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerously-allow-browser": "true" };
-      let systemMessage = messages.find(m => m.role === 'system')?.content || "";
+      let systemMessage = customSystemPrompt || messages.find(m => m.role === 'system')?.content || "";
 
       const claudeMessages = messages.filter(m => m.role !== 'system').map(m => {
         let content = m.content;
@@ -457,9 +488,11 @@ document.addEventListener('DOMContentLoaded', () => {
         return { role: m.role === 'assistant' ? 'model' : 'user', parts: parts };
       });
 
-      body = JSON.stringify({
-        contents: geminiMessages
-      });
+      const requestBody = { contents: geminiMessages };
+      if (customSystemPrompt) {
+        requestBody.systemInstruction = { parts: [{ text: customSystemPrompt }] };
+      }
+      body = JSON.stringify(requestBody);
     }
 
     const response = await fetch(url, { method: "POST", headers, body });
