@@ -1,4 +1,31 @@
 document.addEventListener('DOMContentLoaded', () => {
+  // --- MATHJAX RENDERING ---
+  function renderMathIn(container) {
+    if (window.renderMathInElement) {
+      renderMathInElement(container, {
+        delimiters: [
+          { left: '$$', right: '$$', display: true },
+          { left: '$', right: '$', display: false },
+          { left: '\\(', right: '\\)', display: false },
+          { left: '\\[', right: '\\]', display: true }
+        ],
+        throwOnError: false,
+        trust: true
+      });
+    }
+  }
+
+  function renderKaTeX(latex, display) {
+    if (window.katex) {
+      try {
+        return katex.renderToString(latex, { displayMode: display, throwOnError: false, trust: true });
+      } catch (e) {
+        return display ? `$$${latex}$$` : `$${latex}$`;
+      }
+    }
+    return display ? `$$${latex}$$` : `$${latex}$`;
+  }
+
   const elements = {
     settingsBtn: document.getElementById('settings-btn'),
     settingsPanel: document.getElementById('settings-panel'),
@@ -17,7 +44,10 @@ document.addEventListener('DOMContentLoaded', () => {
     historyList: document.getElementById('history-list'),
     newChatBtn: document.getElementById('new-chat-btn'),
     systemPromptInput: document.getElementById('system-prompt-input'),
-    scrollBottomBtn: document.getElementById('scroll-bottom-btn')
+    scrollBottomBtn: document.getElementById('scroll-bottom-btn'),
+    modelSelect: document.getElementById('model-select'),
+    fetchModelsBtn: document.getElementById('fetch-models-btn'),
+    customModelRow: document.getElementById('custom-model-row')
   };
 
   let currentSessionId = null;
@@ -30,17 +60,155 @@ document.addEventListener('DOMContentLoaded', () => {
     nvidia: "meta/llama3-70b-instruct"
   };
 
+  // --- MODEL FETCHING ---
+  const modelEndpoints = {
+    openai: { url: "https://api.openai.com/v1/models", auth: (key) => `Bearer ${key}`, parse: (data) => data.data?.map(m => m.id).filter(id => id.includes('gpt') || id.includes('o1') || id.includes('o3') || id.includes('chat')).sort() || [] },
+    groq: { url: "https://api.groq.com/openai/v1/models", auth: (key) => `Bearer ${key}`, parse: (data) => data.data?.map(m => m.id).sort() || [] },
+    nvidia: { url: "https://integrate.api.nvidia.com/v1/models", auth: (key) => `Bearer ${key}`, parse: (data) => data.data?.map(m => m.id).filter(id => id.includes('chat') || id.includes('instruct')).sort() || [] },
+    claude: { url: "https://api.anthropic.com/v1/models", auth: (key) => key, parse: (data) => data.data?.map(m => m.id).sort() || [] },
+    gemini: { url: "https://generativelanguage.googleapis.com/v1beta/models", auth: null, parse: (data) => data.models?.map(m => m.name.replace('models/', '')).filter(n => n.includes('gemini') && !n.includes('embedding')).sort() || [] }
+  };
+
+  async function fetchModels(provider, apiKey) {
+    const endpoint = modelEndpoints[provider];
+    if (!endpoint) return [];
+
+    const headers = { "Content-Type": "application/json" };
+    let url = endpoint.url;
+
+    if (provider === 'gemini') {
+      url += `?key=${apiKey}`;
+    } else if (endpoint.auth) {
+      headers["Authorization"] = endpoint.auth(apiKey);
+    }
+    if (provider === 'claude') {
+      headers["anthropic-version"] = "2023-06-01";
+    }
+
+    const response = await fetch(url, { method: "GET", headers });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    return endpoint.parse(data);
+  }
+
+  function populateModelDropdown(models, selectedModel) {
+    elements.modelSelect.innerHTML = '';
+    models.forEach(model => {
+      const opt = document.createElement('option');
+      opt.value = model;
+      opt.textContent = model;
+      elements.modelSelect.appendChild(opt);
+    });
+    // Add custom option at end
+    const customOpt = document.createElement('option');
+    customOpt.value = '__custom__';
+    customOpt.textContent = '✏️ Custom model name...';
+    elements.modelSelect.appendChild(customOpt);
+
+    // Set selected value
+    if (selectedModel && models.includes(selectedModel)) {
+      elements.modelSelect.value = selectedModel;
+    } else if (selectedModel) {
+      // User had a custom model saved — set to custom and fill input
+      elements.modelSelect.value = '__custom__';
+      elements.modelInput.value = selectedModel;
+      elements.customModelRow.classList.remove('hidden');
+    } else {
+      // Default to first model
+      elements.modelSelect.value = models[0] || '';
+    }
+  }
+
+  async function autoFetchModels() {
+    const apiKey = elements.apikeyInput.value.trim();
+    const provider = elements.providerSelect.value;
+    if (!apiKey) return;
+
+    elements.fetchModelsBtn.classList.add('spinning');
+    elements.fetchModelsBtn.disabled = true;
+
+    try {
+      const models = await fetchModels(provider, apiKey);
+      if (models.length > 0) {
+        chrome.storage.local.get(['model'], (data) => {
+          populateModelDropdown(models, data.model);
+        });
+      } else {
+        // Fallback: show default model only
+        populateModelDropdown([defaultModels[provider]], null);
+      }
+    } catch (e) {
+      console.warn('Failed to fetch models:', e);
+      // Fallback to default
+      populateModelDropdown([defaultModels[provider]], null);
+    } finally {
+      elements.fetchModelsBtn.classList.remove('spinning');
+      elements.fetchModelsBtn.disabled = false;
+    }
+  }
+
   // Load Settings
-  chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt'], (data) => {
+  chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt', 'apiKeys', 'models'], (data) => {
     if (data.provider) elements.providerSelect.value = data.provider;
-    if (data.model) elements.modelInput.value = data.model;
-    if (data.apiKey) elements.apikeyInput.value = data.apiKey;
     if (data.systemPrompt) elements.systemPromptInput.value = data.systemPrompt;
-    elements.modelInput.placeholder = `e.g. ${defaultModels[elements.providerSelect.value]}`;
+
+    // Restore per-provider API key and model
+    const currentProvider = elements.providerSelect.value;
+    const savedKeys = data.apiKeys || {};
+    const savedModels = data.models || {};
+    const keyToUse = savedKeys[currentProvider] || data.apiKey || '';
+    const modelToUse = savedModels[currentProvider] || data.model || '';
+    if (keyToUse) elements.apikeyInput.value = keyToUse;
+
+    // Populate model dropdown with defaults first, then try fetching
+    populateModelDropdown([defaultModels[currentProvider]], modelToUse);
+    if (keyToUse) {
+      autoFetchModels();
+    }
   });
 
   elements.providerSelect.addEventListener('change', (e) => {
-    elements.modelInput.placeholder = `e.g. ${defaultModels[e.target.value]}`;
+    const newProvider = e.target.value;
+    // Load saved key/model for this provider
+    chrome.storage.local.get(['apiKeys', 'models', 'apiKey', 'model'], (data) => {
+      const savedKeys = data.apiKeys || {};
+      const savedModels = data.models || {};
+      const keyForProvider = savedKeys[newProvider] || '';
+      const modelForProvider = savedModels[newProvider] || '';
+
+      elements.apikeyInput.value = keyForProvider;
+      elements.customModelRow.classList.add('hidden');
+      populateModelDropdown([defaultModels[newProvider]], modelForProvider);
+
+      if (keyForProvider) {
+        autoFetchModels();
+      }
+    });
+  });
+
+  // Fetch models button
+  elements.fetchModelsBtn.addEventListener('click', () => {
+    autoFetchModels();
+  });
+
+  // Model select change — show/hide custom input
+  elements.modelSelect.addEventListener('change', (e) => {
+    if (e.target.value === '__custom__') {
+      elements.customModelRow.classList.remove('hidden');
+      elements.modelInput.focus();
+    } else {
+      elements.customModelRow.classList.add('hidden');
+    }
+  });
+
+  // Auto-fetch models when API key is entered (debounced)
+  let fetchDebounce = null;
+  elements.apikeyInput.addEventListener('input', () => {
+    clearTimeout(fetchDebounce);
+    const key = elements.apikeyInput.value.trim();
+    if (key && key.length > 10) {
+      fetchDebounce = setTimeout(autoFetchModels, 600);
+    }
   });
 
   elements.settingsBtn.addEventListener('click', () => {
@@ -61,29 +229,43 @@ document.addEventListener('DOMContentLoaded', () => {
     elements.historyPanel.classList.remove('open');
   });
 
+  function generateTitle(text) {
+    if (!text) return 'New Chat';
+    let question = text;
+    const ctxMatch = text.match(/User Question:\s*([\s\S]+)$/);
+    if (ctxMatch) question = ctxMatch[1].trim();
+    question = question.replace(/```[\s\S]*?```/g, '').replace(/`[^`]+`/g, '').replace(/[#*_~>]/g, '').replace(/\s+/g, ' ').trim();
+    if (!question) return 'New Chat';
+    const stopWords = new Set(['a','an','the','is','are','was','were','be','been','being','am','i','me','my','mine','we','us','our','ours','you','your','yours','he','him','his','she','her','hers','it','its','they','them','their','theirs','what','which','who','whom','whose','that','this','these','those','do','does','did','doing','done','have','has','having','had','will','would','shall','should','can','could','may','might','must','need','ought','dare','used','to','of','in','for','on','with','at','by','from','as','into','through','during','before','after','above','below','between','out','off','over','under','again','further','then','once','here','there','when','where','why','how','all','both','each','few','more','most','other','some','such','no','nor','not','only','own','same','so','than','too','very','just','don','now','also','about','up','please','could','would','like','want','need','know','tell','show','make','give','use','get','go','see','come','think','take','help','find','let','try','keep','put','say','said','ask','let']);
+    const words = question.split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w.toLowerCase().replace(/[^a-z]/g, '')));
+    if (words.length === 0) return question.substring(0, 40) + (question.length > 40 ? '...' : '');
+    const selected = words.slice(0, 7);
+    let title = selected.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+    if (title.length > 45) title = title.substring(0, 45).replace(/\s+\S*$/, '');
+    return title || 'New Chat';
+  }
+
   function createSession() {
     currentSessionId = 'session_' + Date.now();
     chatHistory = [];
     elements.chatContainer.innerHTML = '';
-    appendMessage('AI', "Hello! I'm your Omni-Copilot. How can I help you today?", 'ai-message', true);
+    const greetingDiv = appendMessage('AI', "Hello! I'm your Omni-Copilot. How can I help you today?", 'ai-message', true);
+    renderMathIn(greetingDiv);
     saveSession();
   }
 
   function saveSession() {
-    if (!currentSessionId) return;
+    if (!currentSessionId || chatHistory.length === 0) return;
     chrome.storage.local.get(['sessions'], (data) => {
       const sessions = data.sessions || {};
       const session = sessions[currentSessionId] || {
         id: currentSessionId,
-        title: chatHistory[0]?.content?.substring(0, 30) || 'New Chat',
+        title: generateTitle(chatHistory[0]?.content),
         messages: [],
         timestamp: Date.now()
       };
       session.messages = chatHistory;
       session.timestamp = Date.now();
-      if (chatHistory.length > 0 && session.title === 'New Chat') {
-        session.title = chatHistory[0].content.substring(0, 30) + (chatHistory[0].content.length > 30 ? '...' : '');
-      }
       sessions[currentSessionId] = session;
 
       // Prune to keep only the last 3 sessions
@@ -105,12 +287,20 @@ document.addEventListener('DOMContentLoaded', () => {
         currentSessionId = id;
         chatHistory = session.messages;
         elements.chatContainer.innerHTML = '';
-        chatHistory.forEach(msg => {
+        chatHistory.forEach((msg, i) => {
           const sender = msg.role === 'user' ? 'You' : (msg.role === 'assistant' ? 'AI' : 'System');
           const className = msg.role === 'user' ? 'user-message' : (msg.role === 'assistant' ? 'ai-message' : 'system-msg');
           const isHTML = msg.role === 'assistant';
+          if (isHTML && !msg.responses) {
+            msg.responses = [msg.content];
+            msg.currentIndex = 0;
+          }
           const contentToRender = isHTML ? parseMarkdown(msg.content) : msg.content;
-          appendMessage(sender, contentToRender, className, isHTML);
+          const msgDiv = appendMessage(sender, contentToRender, className, isHTML);
+          if (isHTML && msgDiv) {
+            renderMathIn(msgDiv);
+            updateResponseNav(msgDiv);
+          }
         });
         elements.historyPanel.classList.remove('open');
       }
@@ -137,12 +327,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
   elements.saveSettingsBtn.addEventListener('click', () => {
     const provider = elements.providerSelect.value;
-    const model = elements.modelInput.value.trim() || defaultModels[provider];
+    const selectedVal = elements.modelSelect.value;
+    let model;
+    if (selectedVal === '__custom__') {
+      model = elements.modelInput.value.trim() || defaultModels[provider];
+    } else if (selectedVal) {
+      model = selectedVal;
+    } else {
+      model = defaultModels[provider];
+    }
     const apiKey = elements.apikeyInput.value.trim();
     const systemPrompt = elements.systemPromptInput.value.trim();
-    chrome.storage.local.set({ provider, model, apiKey, systemPrompt }, () => {
-      elements.settingsPanel.classList.remove('open');
-      appendMessage('System', 'Settings saved successfully!', 'system-msg', false);
+    // Save to per-provider storage and current values
+    chrome.storage.local.get(['apiKeys', 'models'], (data) => {
+      const savedKeys = data.apiKeys || {};
+      const savedModels = data.models || {};
+      savedKeys[provider] = apiKey;
+      savedModels[provider] = model;
+      chrome.storage.local.set({ provider, model, apiKey, systemPrompt, apiKeys: savedKeys, models: savedModels }, () => {
+        elements.settingsPanel.classList.remove('open');
+        appendMessage('System', `Settings saved for ${provider}! Using model: ${model}`, 'system-msg', false);
+      });
     });
   });
 
@@ -178,6 +383,34 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Start a new session by default on load
   createSession();
+
+  // Auto-focus input when panel is opened or becomes visible
+  elements.promptInput.focus();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      elements.promptInput.focus();
+    }
+  });
+
+  // Shortcut toast notification
+  const shortcutToast = document.getElementById('shortcut-toast');
+  const toastClose = document.getElementById('toast-close');
+  const toastDontShow = document.getElementById('toast-dont-show');
+
+  chrome.storage.local.get(['hideShortcutToast'], (data) => {
+    if (!data.hideShortcutToast) {
+      shortcutToast.classList.remove('hidden');
+    }
+  });
+
+  toastClose.addEventListener('click', () => {
+    shortcutToast.classList.add('hidden');
+  });
+
+  toastDontShow.addEventListener('click', () => {
+    chrome.storage.local.set({ hideShortcutToast: true });
+    shortcutToast.classList.add('hidden');
+  });
 
   // IMAGE PASTE LOGIC
   elements.promptInput.addEventListener('paste', (e) => {
@@ -231,6 +464,166 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  // MESSAGE ACTION BUTTONS
+  let currentSpeech = null;
+
+  function getMsgIndex(msgDiv) {
+    const msgs = [...elements.chatContainer.querySelectorAll('.ai-message')];
+    return msgs.indexOf(msgDiv);
+  }
+
+  function getMsgEntry(msgDiv) {
+    const idx = getMsgIndex(msgDiv);
+    return chatHistory[idx];
+  }
+
+  function getPlainText(msgDiv) {
+    const content = msgDiv.querySelector('.message-content');
+    if (!content) return '';
+    const clone = content.cloneNode(true);
+    clone.querySelectorAll('.thinking-block').forEach(el => el.remove());
+    return clone.innerText;
+  }
+
+  function getRawMarkdown(msgDiv) {
+    const entry = getMsgEntry(msgDiv);
+    if (!entry) return '';
+    return entry.content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  }
+
+  function updateResponseNav(msgDiv) {
+    const entry = getMsgEntry(msgDiv);
+    if (!entry || !entry.responses) return;
+    const nav = msgDiv.querySelector('.response-nav');
+    if (!nav) return;
+    const total = entry.responses.length;
+    nav.style.display = total > 1 ? 'flex' : 'none';
+    nav.querySelector('.resp-counter').textContent = `${entry.currentIndex + 1}/${total}`;
+    nav.querySelector('.resp-prev').disabled = entry.currentIndex === 0;
+    nav.querySelector('.resp-next').disabled = entry.currentIndex === total - 1;
+  }
+
+  elements.chatContainer.addEventListener('click', (e) => {
+    const msgDiv = e.target.closest('.message');
+    if (!msgDiv || !msgDiv.classList.contains('ai-message')) return;
+    const entry = getMsgEntry(msgDiv);
+
+    if (e.target.closest('.copy-msg-btn')) {
+      const text = getRawMarkdown(msgDiv);
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = e.target.closest('.copy-msg-btn');
+        const tooltip = btn.querySelector('.tooltip');
+        if (tooltip) { tooltip.textContent = 'Copied!'; setTimeout(() => tooltip.textContent = 'Copy', 1500); }
+      });
+      return;
+    }
+
+    if (e.target.closest('.read-aloud-btn')) {
+      const btn = e.target.closest('.read-aloud-btn');
+      if (currentSpeech) {
+        speechSynthesis.cancel();
+        currentSpeech = null;
+        document.querySelectorAll('.read-aloud-btn.active').forEach(b => b.classList.remove('active'));
+        return;
+      }
+      const text = getPlainText(msgDiv);
+      if (!text) return;
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.onend = () => { currentSpeech = null; document.querySelectorAll('.read-aloud-btn.active').forEach(b => b.classList.remove('active')); };
+      currentSpeech = utter;
+      btn.classList.add('active');
+      speechSynthesis.speak(utter);
+      return;
+    }
+
+    if (e.target.closest('.regenerate-btn')) {
+      if (!entry || !entry.responses) return;
+      const aiMsgIdx = getMsgIndex(msgDiv);
+      const allMsgs = [...elements.chatContainer.querySelectorAll('.message')];
+      const msgDivIndex = allMsgs.indexOf(msgDiv);
+      let lastUserMsg = null;
+      for (let i = msgDivIndex - 1; i >= 0; i--) {
+        if (allMsgs[i].classList.contains('user-message')) {
+          lastUserMsg = allMsgs[i];
+          break;
+        }
+      }
+      if (!lastUserMsg) return;
+      const userText = lastUserMsg.querySelector('.message-content')?.innerText || '';
+      const textDiv = msgDiv.querySelector('.message-content');
+      textDiv.innerHTML = `<div class="typing-indicator"><span></span><span></span><span></span></div>`;
+
+      chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt'], async (settings) => {
+        if (!settings.apiKey) { textDiv.innerHTML = '⚠️ Please set your API key in Settings first.'; return; }
+        let pageContext = "";
+        if (elements.readPageToggle.checked) pageContext = await getPageContext();
+        const promptWithContext = pageContext ? `Context from current webpage:\n\n${pageContext}\n\nUser Question: ${userText}` : userText;
+        const tempHistory = chatHistory.slice(0, aiMsgIdx).concat([{ role: 'user', content: promptWithContext }]);
+        try {
+          let lastScroll = 0;
+          const throttledScroll = () => {
+            const now = Date.now();
+            if (now - lastScroll > 100) {
+              lastScroll = now;
+              elements.chatContainer.scrollTo({ top: elements.chatContainer.scrollHeight });
+            }
+          };
+          let thinkingGlow = null;
+          const startGlow = () => {
+            if (thinkingGlow) return;
+            let phase = 0;
+            thinkingGlow = setInterval(() => {
+              phase += 0.08;
+              const el = textDiv.querySelector('.thinking-block.streaming');
+              if (el) {
+                const s = Math.abs(Math.sin(phase));
+                el.style.boxShadow = `0 0 ${6 + 14 * s}px rgba(56, 189, 248, ${0.3 + 0.2 * s})`;
+              }
+            }, 50);
+          };
+          const stopGlow = () => {
+            if (thinkingGlow) { clearInterval(thinkingGlow); thinkingGlow = null; }
+            const el = textDiv.querySelector('.thinking-block');
+            if (el) el.style.boxShadow = '';
+          };
+          const onToken = (partialText) => {
+            textDiv.innerHTML = parseMarkdown(partialText, true);
+            renderMathIn(textDiv);
+            startGlow();
+            throttledScroll();
+          };
+
+          const response = await fetchAIResponse(settings.provider, settings.model || defaultModels[settings.provider], settings.apiKey, tempHistory, [], settings.systemPrompt, onToken);
+          stopGlow();
+          entry.responses.push(response);
+          entry.currentIndex = entry.responses.length - 1;
+          entry.content = response;
+          textDiv.innerHTML = parseMarkdown(response);
+          renderMathIn(textDiv);
+          saveSession();
+          updateResponseNav(msgDiv);
+        } catch (error) {
+          if (thinkingGlow) { clearInterval(thinkingGlow); thinkingGlow = null; }
+          textDiv.innerHTML = `❌ Error: ${error.message}`;
+        }
+      });
+      return;
+    }
+
+    if (e.target.closest('.resp-prev') || e.target.closest('.resp-next')) {
+      if (!entry || !entry.responses) return;
+      const dir = e.target.closest('.resp-prev') ? -1 : 1;
+      entry.currentIndex = Math.max(0, Math.min(entry.responses.length - 1, entry.currentIndex + dir));
+      entry.content = entry.responses[entry.currentIndex];
+      const textDiv = msgDiv.querySelector('.message-content');
+      textDiv.innerHTML = parseMarkdown(entry.content);
+      renderMathIn(textDiv);
+      saveSession();
+      updateResponseNav(msgDiv);
+      return;
+    }
+  });
+
   async function sendMessage() {
     const text = elements.promptInput.value.trim();
     if (!text && pendingImages.length === 0) return;
@@ -249,7 +642,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt'], async (settings) => {
       if (!settings.apiKey) {
-        aiMessageDiv.innerHTML = '⚠️ Please set your API key in Settings first.';
+        aiMessageDiv.querySelector('.message-content').innerHTML = '⚠️ Please set your API key in Settings first.';
         elements.settingsPanel.classList.add('open');
         return;
       }
@@ -265,16 +658,81 @@ document.addEventListener('DOMContentLoaded', () => {
       saveSession();
 
       try {
+        const contentDiv = aiMessageDiv.querySelector('.message-content');
+        let lastScroll = 0;
+        const throttledScroll = () => {
+          const now = Date.now();
+          if (now - lastScroll > 100) {
+            lastScroll = now;
+            elements.chatContainer.scrollTo({ top: elements.chatContainer.scrollHeight });
+          }
+        };
+        let thinkingGlow = null;
+        const startGlow = () => {
+          if (thinkingGlow) return;
+          let phase = 0;
+          thinkingGlow = setInterval(() => {
+            phase += 0.08;
+            const el = contentDiv.querySelector('.thinking-block.streaming');
+            if (el) {
+              const s = Math.abs(Math.sin(phase));
+              el.style.boxShadow = `0 0 ${6 + 14 * s}px rgba(56, 189, 248, ${0.3 + 0.2 * s})`;
+            }
+          }, 50);
+        };
+        const stopGlow = () => {
+          if (thinkingGlow) { clearInterval(thinkingGlow); thinkingGlow = null; }
+          const el = contentDiv.querySelector('.thinking-block');
+          if (el) el.style.boxShadow = '';
+        };
+        const onToken = (partialText) => {
+          contentDiv.innerHTML = parseMarkdown(partialText, true);
+          renderMathIn(contentDiv);
+          startGlow();
+          throttledScroll();
+        };
+
         const response = await fetchAIResponse(
           settings.provider, settings.model || defaultModels[settings.provider],
-          settings.apiKey, chatHistory, imagesToSend, settings.systemPrompt
+          settings.apiKey, chatHistory, imagesToSend, settings.systemPrompt,
+          onToken
         );
 
-        aiMessageDiv.innerHTML = parseMarkdown(response);
-        chatHistory.push({ role: 'assistant', content: response });
+        stopGlow();
+        contentDiv.innerHTML = parseMarkdown(response);
+        renderMathIn(contentDiv);
+        chatHistory.push({ role: 'assistant', content: response, responses: [response], currentIndex: 0 });
         saveSession();
+
+        const actionsDiv = document.createElement('div');
+        actionsDiv.className = 'message-actions';
+        actionsDiv.innerHTML = `
+          <button class="action-btn copy-msg-btn" title="Copy">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            <span class="tooltip">Copy</span>
+          </button>
+          <button class="action-btn read-aloud-btn" title="Read aloud">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+            <span class="tooltip">Read aloud</span>
+          </button>
+          <button class="action-btn regenerate-btn" title="Regenerate">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            <span class="tooltip">Regenerate</span>
+          </button>
+          <div class="response-nav" style="display:none;">
+            <button class="resp-prev" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+            <span class="resp-counter">1/1</span>
+            <button class="resp-next" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </button>
+          </div>
+        `;
+        aiMessageDiv.appendChild(actionsDiv);
       } catch (error) {
-        aiMessageDiv.innerHTML = `❌ Error: ${error.message}`;
+        if (thinkingGlow) { clearInterval(thinkingGlow); thinkingGlow = null; }
+        aiMessageDiv.querySelector('.message-content').innerHTML = `❌ Error: ${error.message}`;
         chatHistory.pop();
       }
       elements.chatContainer.scrollTo({ top: elements.chatContainer.scrollHeight, behavior: 'smooth' });
@@ -298,9 +756,39 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const textDiv = document.createElement('div');
+    textDiv.className = 'message-content';
     if (isHTML) textDiv.innerHTML = text;
     else textDiv.innerText = text;
     div.appendChild(textDiv);
+
+    if (className === 'ai-message' && !text.includes('typing-indicator')) {
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'message-actions';
+      actionsDiv.innerHTML = `
+        <button class="action-btn copy-msg-btn" title="Copy">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          <span class="tooltip">Copy</span>
+        </button>
+        <button class="action-btn read-aloud-btn" title="Read aloud">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+          <span class="tooltip">Read aloud</span>
+        </button>
+        <button class="action-btn regenerate-btn" title="Regenerate">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <span class="tooltip">Regenerate</span>
+        </button>
+        <div class="response-nav" style="display:none;">
+          <button class="resp-prev" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <span class="resp-counter">1/1</span>
+          <button class="resp-next" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
+      `;
+      div.appendChild(actionsDiv);
+    }
 
     elements.chatContainer.appendChild(div);
     elements.chatContainer.scrollTo({ top: elements.chatContainer.scrollHeight, behavior: 'smooth' });
@@ -356,17 +844,69 @@ document.addEventListener('DOMContentLoaded', () => {
   
 
   // --- MARKDOWN PARSER ---
-  function parseMarkdown(text) {
+  function parseMarkdown(text, streaming = false) {
     const codeBlocks =[];
+    const mathBlocks = [];
 
     // 0. Handle Thinking Process (Reasoning)
-    text = text.replace(/<think>([\s\S]*?)<\/think>/gi, (match, content) => {
-      return `
-        <details class="thinking-block">
-          <summary class="thinking-summary">🤔 Thinking Process</summary>
-          <div class="thinking-content">${content.trim()}</div>
-        </details>
-      `;
+    if (streaming) {
+      // During streaming: replace complete blocks WITH streaming class
+      text = text.replace(/<think>([\s\S]*?)<\/think>/gi, (match, content) => {
+        return `
+          <details class="thinking-block streaming">
+            <summary class="thinking-summary">🤔 Thinking Process</summary>
+            <div class="thinking-content">${content.trim()}</div>
+          </details>
+        `;
+      });
+      // Handle incomplete (open) thinking tags
+      const openThinkIdx = text.indexOf('<think>');
+      if (openThinkIdx !== -1) {
+        const beforeThink = text.substring(0, openThinkIdx);
+        const thinkContent = text.substring(openThinkIdx + 7);
+        text = beforeThink + `
+          <details class="thinking-block streaming">
+            <summary class="thinking-summary">🤔 Thinking Process</summary>
+            <div class="thinking-content">${thinkContent}</div>
+          </details>
+        `;
+      }
+    } else {
+      // Not streaming: normal thinking blocks without streaming class
+      text = text.replace(/<think>([\s\S]*?)<\/think>/gi, (match, content) => {
+        return `
+          <details class="thinking-block">
+            <summary class="thinking-summary">🤔 Thinking Process</summary>
+            <div class="thinking-content">${content.trim()}</div>
+          </details>
+        `;
+      });
+    }
+
+    // 0.5. Extract Math Blocks (display $$...$$, \[...\], then inline $...$, \(...\))
+    // Display math: $$...$$
+    text = text.replace(/\$\$([\s\S]*?)\$\$/g, (match, latex) => {
+      const id = `%%MATH_BLOCK_${mathBlocks.length}%%`;
+      mathBlocks.push({ latex: latex.trim(), display: true });
+      return id;
+    });
+    // Display math: \[...\]
+    text = text.replace(/\\\[([\s\S]*?)\\\]/g, (match, latex) => {
+      const id = `%%MATH_BLOCK_${mathBlocks.length}%%`;
+      mathBlocks.push({ latex: latex.trim(), display: true });
+      return id;
+    });
+    // Inline math: $...$  (but not $$ and not escaped \$)
+    text = text.replace(/(?<!\$)(?<!\\)\$(?!\$)((?:[^$\\]|\\.)+?)\$(?!\$)/g, (match, latex) => {
+      const id = `%%MATH_BLOCK_${mathBlocks.length}%%`;
+      mathBlocks.push({ latex: latex.trim(), display: false });
+      return id;
+    });
+    // Inline math: \(...\)
+    text = text.replace(/\\\(([\s\S]*?)\\\)/g, (match, latex) => {
+      const id = `%%MATH_BLOCK_${mathBlocks.length}%%`;
+      mathBlocks.push({ latex: latex.trim(), display: false });
+      return id;
     });
 
     // 1. Extract Code Blocks safely and capture the language
@@ -381,18 +921,38 @@ document.addEventListener('DOMContentLoaded', () => {
       .replace(/^### (.*$)/gim, '<h3>$1</h3>') 
       .replace(/^## (.*$)/gim, '<h2>$1</h2>')  
       .replace(/^# (.*$)/gim, '<h1>$1</h1>')   
+      .replace(/^---$/gim, '<hr>')
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>') 
       .replace(/\*([^*]+)\*/g, '<em>$1</em>') 
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>') 
-      .replace(/^\d+\.\s+(.*$)/gim, '<ol><li>$1</li></ol>') 
+      .replace(/((?:^\d+\.\s+(?!.*\*\*)(.*$)\n?(?:[ \t]+.*\n?|\n)*))+/gim, (match) => {
+        const items = match.trim().split('\n').map(line => {
+          const m = line.match(/^\d+\.\s+(?!.*\*\*)(.*)$/);
+          if (m) return '<li>' + m[1] + '</li>';
+          if (line.trim()) return '<ul><li>' + line.trim() + '</li></ul>';
+          return '';
+        }).filter(Boolean).join('');
+        return '<ol>' + items + '</ol>';
+      })
       .replace(/^[-*]\s+(.*$)/gim, '<ul><li>$1</li></ul>')  
       .replace(/\n/g, '<br/>'); 
 
-    // 3. Clean up overlapping list tags
+    // 3. Clean up overlapping list tags and extra br after block elements
     html = html.replace(/<\/ul><br\/><ul>/g, '').replace(/<\/ol><br\/><ol>/g, '');
     html = html.replace(/<\/ul>\s*<ul>/g, '').replace(/<\/ol>\s*<ol>/g, '');
+    html = html.replace(/<\/details><br\/>/g, '</details>');
+    html = html.replace(/<\/div><br\/>/g, '</div>');
+    html = html.replace(/<\/h[1-6]><br\/>/g, (m) => m.replace('<br/>', ''));
+    html = html.replace(/<hr><br\/>/g, '<hr>');
+    html = html.replace(/<br\/><hr>/g, '<hr>');
 
-    // 4. Restore Code Blocks with the Beautiful UI
+    // 4. Restore Math Blocks (render KaTeX directly)
+    html = html.replace(/%%MATH_BLOCK_(\d+)%%/g, (match, index) => {
+      const block = mathBlocks[index];
+      return renderKaTeX(block.latex, block.display);
+    });
+
+    // 5. Restore Code Blocks with the Beautiful UI
     html = html.replace(/%%%CODE_BLOCK_(\d+)%%%/g, (match, index) => {
       const block = codeBlocks[index];
       const encodedCode = encodeURIComponent(block.code);
@@ -437,8 +997,9 @@ document.addEventListener('DOMContentLoaded', () => {
     return result || "";
   }
 
-  async function fetchAIResponse(provider, model, apiKey, messages, pendingImages = [], customSystemPrompt = "") {
+  async function fetchAIResponse(provider, model, apiKey, messages, pendingImages = [], customSystemPrompt = "", onToken = null) {
     let url, headers, body;
+    const streaming = !!onToken;
 
     if (['openai', 'groq', 'nvidia'].includes(provider)) {
       const urls = { openai: "https://api.openai.com/v1/chat/completions", groq: "https://api.groq.com/openai/v1/chat/completions", nvidia: "https://integrate.api.nvidia.com/v1/chat/completions" };
@@ -454,14 +1015,14 @@ document.addEventListener('DOMContentLoaded', () => {
             ]
           };
         }
-        return m;
+        return { role: m.role, content: m.content };
       });
 
       if (customSystemPrompt) {
         formattedMessages.unshift({ role: "system", content: customSystemPrompt });
       }
 
-      body = JSON.stringify({ model, messages: formattedMessages });
+      body = JSON.stringify({ model, messages: formattedMessages, max_tokens: 4096, stream: streaming });
     } else if (provider === 'claude') {
       url = "https://api.anthropic.com/v1/messages"; headers = { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerously-allow-browser": "true" };
       let systemMessage = customSystemPrompt || messages.find(m => m.role === 'system')?.content || "";
@@ -476,9 +1037,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         return { role: m.role === 'assistant' ? 'assistant' : 'user', content: content };
       });
-      body = JSON.stringify({ model, max_tokens: 1500, system: systemMessage, messages: claudeMessages });
+      body = JSON.stringify({ model, max_tokens: 4096, stream: streaming, system: systemMessage, messages: claudeMessages });
     } else if (provider === 'gemini') {
-      url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`; headers = { "Content-Type": "application/json" };
+      const endpoint = streaming ? 'streamGenerateContent' : 'generateContent';
+      url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:${endpoint}?key=${apiKey}${streaming ? '&alt=sse' : ''}`;
+      headers = { "Content-Type": "application/json" };
 
       const geminiMessages = messages.map(m => {
         const parts = [{ text: m.content }];
@@ -496,11 +1059,105 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const response = await fetch(url, { method: "POST", headers, body });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || data.error || "Failed to fetch response");
+    if (!response.ok) {
+      const errData = await response.json();
+      throw new Error(errData.error?.message || errData.error || "Failed to fetch response");
+    }
 
-    if (['openai', 'groq', 'nvidia'].includes(provider)) return data.choices[0].message.content;
-    if (provider === 'claude') return data.content[0].text;
-    if (provider === 'gemini') return data.candidates[0].content.parts[0].text;
+    if (!streaming) {
+      const data = await response.json();
+      if (['openai', 'groq', 'nvidia'].includes(provider)) return data.choices[0].message.content;
+      if (provider === 'claude') return data.content[0].text;
+      if (provider === 'gemini') {
+        const candidate = data.candidates?.[0];
+        if (candidate?.content?.parts?.[0]?.text) return candidate.content.parts[0].text;
+        if (candidate?.finishReason === 'SAFETY') throw new Error('Response blocked by Gemini safety filters');
+        throw new Error('No text in Gemini response');
+      }
+    }
+
+    // Streaming response handling
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let buffer = '';
+    let rawChunks = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      rawChunks.push(chunk);
+      buffer += chunk;
+
+      if (['openai', 'groq', 'nvidia'].includes(provider)) {
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim();
+            if (data === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(data);
+              const token = parsed.choices?.[0]?.delta?.content;
+              if (token) { fullText += token; if (onToken) onToken(fullText); }
+            } catch (e) {}
+          }
+        }
+      } else if (provider === 'claude') {
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const parsed = JSON.parse(line.slice(6));
+              if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+                fullText += parsed.delta.text;
+                if (onToken) onToken(fullText);
+              }
+            } catch (e) {}
+          }
+        }
+      } else if (provider === 'gemini') {
+        // Gemini streamGenerateContent returns SSE with data: prefix
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const jsonStr = trimmed.startsWith('data: ') ? trimmed.slice(6).trim() : trimmed;
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const token = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (token) { fullText += token; if (onToken) onToken(fullText); }
+            if (parsed.candidates?.[0]?.finishReason === 'SAFETY' && !fullText) {
+              throw new Error('Response blocked by Gemini safety filters');
+            }
+          } catch (e) {
+            if (e.message.includes('safety')) throw e;
+          }
+        }
+      }
+    }
+
+    // Fallback: if streaming yielded nothing, try parsing raw response as JSON array
+    if (!fullText && rawChunks.length > 0) {
+      try {
+        const raw = rawChunks.join('');
+        const arr = JSON.parse(raw);
+        const items = Array.isArray(arr) ? arr : [arr];
+        for (const item of items) {
+          const token = item.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (token) fullText += token;
+        }
+      } catch (e) {}
+    }
+
+    // Debug: log if Gemini returned nothing
+    if (!fullText && provider === 'gemini') {
+      console.warn('[Omni-Copilot] Empty Gemini response. Raw chunks:', rawChunks.join('').substring(0, 500));
+    }
+
+    return fullText;
   }
 });
