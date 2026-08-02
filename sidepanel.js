@@ -672,22 +672,154 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    if (e.target.closest('.user-edit-btn')) {
-      if (isStreaming) return;
+    if (e.target.closest('.edit-confirm-btn')) {
+      const textarea = userMsgDiv.querySelector('.edit-textarea');
+      const newText = textarea.value.trim();
+      if (!newText) return;
       const msgIndex = parseInt(userMsgDiv.getAttribute('data-index'));
       if (isNaN(msgIndex)) return;
       const entry = chatHistory[msgIndex];
       if (!entry) return;
-      const rawText = entry.content.replace(/^Context from current webpage:\n\n[\s\S]+?\n\nUser Question:\s*/, '');
-      elements.promptInput.value = rawText;
-      elements.promptInput.style.height = 'auto';
-      elements.promptInput.style.height = (elements.promptInput.scrollHeight < 120 ? elements.promptInput.scrollHeight : 120) + 'px';
-      elements.promptInput.focus();
-      chatHistory.splice(msgIndex);
-      const msgs = [...elements.chatContainer.querySelectorAll('.message')];
-      for (let i = msgs.indexOf(userMsgDiv); i < msgs.length; i++) {
-        msgs[i].remove();
-      }
+      const prefix = entry.content.match(/^Context from current webpage:\n\n[\s\S]+?\n\nUser Question:\s*/)?.[0] || '';
+      entry.content = prefix + newText;
+      chatHistory.splice(msgIndex + 1);
+      const allMsgs = [...elements.chatContainer.querySelectorAll('.message')];
+      const idx = allMsgs.indexOf(userMsgDiv);
+      for (let i = idx + 1; i < allMsgs.length; i++) allMsgs[i].remove();
+      userMsgDiv.querySelector('.message-content').innerText = newText;
+      const editBar = userMsgDiv.querySelector('.edit-actions');
+      if (editBar) editBar.remove();
+      userMsgDiv.querySelector('.message-actions').style.display = '';
+
+      const typingIndicatorHTML = `<div class="typing-indicator"><span></span><span></span><span></span></div>`;
+      const aiMessageDiv = appendMessage('AI', typingIndicatorHTML, 'ai-message', true);
+
+      chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt'], async (settings) => {
+        if (!settings.apiKey) {
+          aiMessageDiv.querySelector('.message-content').innerHTML = '⚠️ Please set your API key in Settings first.';
+          elements.settingsPanel.classList.add('open');
+          return;
+        }
+        currentAbortController = new AbortController();
+        updateSendButton(true);
+        try {
+          const contentDiv = aiMessageDiv.querySelector('.message-content');
+          let thinkingGlow = null;
+          const startGlow = () => {
+            if (thinkingGlow) return;
+            let phase = 0;
+            thinkingGlow = setInterval(() => {
+              phase += 0.08;
+              const el = contentDiv.querySelector('.thinking-block.streaming');
+              if (el) {
+                const s = Math.abs(Math.sin(phase));
+                el.style.boxShadow = `0 0 ${6 + 14 * s}px rgba(56, 189, 248, ${0.3 + 0.2 * s})`;
+              }
+            }, 50);
+          };
+          const stopGlow = () => {
+            if (thinkingGlow) { clearInterval(thinkingGlow); thinkingGlow = null; }
+            const el = contentDiv.querySelector('.thinking-block');
+            if (el) el.style.boxShadow = '';
+          };
+          const onToken = (partialText) => {
+            contentDiv.innerHTML = parseMarkdown(partialText, true);
+            renderMathIn(contentDiv);
+            startGlow();
+          };
+          const response = await fetchAIResponse(
+            settings.provider, settings.model || defaultModels[settings.provider],
+            settings.apiKey, chatHistory, [], settings.systemPrompt,
+            onToken, currentAbortController.signal
+          );
+          stopGlow();
+          contentDiv.innerHTML = parseMarkdown(response);
+          renderMathIn(contentDiv);
+          chatHistory.push({ role: 'assistant', content: response, responses: [response], currentIndex: 0 });
+          saveSession();
+          const actionsDiv = document.createElement('div');
+          actionsDiv.className = 'message-actions';
+          actionsDiv.innerHTML = `
+            <button class="action-btn copy-msg-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span class="tooltip">Copy</span></button>
+            <button class="action-btn read-aloud-btn" title="Read aloud"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span class="tooltip">Read aloud</span></button>
+            <button class="action-btn regenerate-btn" title="Regenerate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg><span class="tooltip">Regenerate</span></button>
+            <div class="response-nav" style="display:none;"><button class="resp-prev" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg></button><span class="resp-counter">1/1</span><button class="resp-next" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></button></div>
+          `;
+          aiMessageDiv.appendChild(actionsDiv);
+        } catch (error) {
+          if (thinkingGlow) { clearInterval(thinkingGlow); thinkingGlow = null; }
+          if (error.name === 'AbortError') {
+            const partialText = contentDiv.innerText || '';
+            if (partialText) {
+              contentDiv.innerHTML = parseMarkdown(partialText);
+              renderMathIn(contentDiv);
+              chatHistory.push({ role: 'assistant', content: partialText, responses: [partialText], currentIndex: 0 });
+              saveSession();
+              const actionsDiv = document.createElement('div');
+              actionsDiv.className = 'message-actions';
+              actionsDiv.innerHTML = `
+                <button class="action-btn copy-msg-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span class="tooltip">Copy</span></button>
+                <button class="action-btn read-aloud-btn" title="Read aloud"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span class="tooltip">Read aloud</span></button>
+                <button class="action-btn regenerate-btn" title="Regenerate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg><span class="tooltip">Regenerate</span></button>
+                <div class="response-nav" style="display:none;"><button class="resp-prev" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg></button><span class="resp-counter">1/1</span><button class="resp-next" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></button></div>
+              `;
+              aiMessageDiv.appendChild(actionsDiv);
+            } else {
+              contentDiv.innerHTML = '⚠️ Response stopped.';
+              chatHistory.pop();
+            }
+          } else {
+            aiMessageDiv.querySelector('.message-content').innerHTML = `❌ Error: ${error.message}`;
+            chatHistory.pop();
+          }
+        } finally {
+          currentAbortController = null;
+          updateSendButton(false);
+        }
+      });
+      return;
+    }
+
+    if (e.target.closest('.edit-cancel-btn')) {
+      const contentDiv = userMsgDiv.querySelector('.message-content');
+      contentDiv.innerText = contentDiv.getAttribute('data-orig-text');
+      const editBar = userMsgDiv.querySelector('.edit-actions');
+      if (editBar) editBar.remove();
+      userMsgDiv.querySelector('.message-actions').style.display = '';
+      return;
+    }
+
+    if (e.target.closest('.user-edit-btn')) {
+      if (isStreaming) return;
+      const contentDiv = userMsgDiv.querySelector('.message-content');
+      const originalText = contentDiv.innerText;
+      contentDiv.setAttribute('data-orig-text', originalText);
+      const textarea = document.createElement('textarea');
+      textarea.className = 'edit-textarea';
+      textarea.value = originalText;
+      textarea.rows = Math.min(originalText.split('\n').length + 1, 8);
+      contentDiv.innerHTML = '';
+      contentDiv.appendChild(textarea);
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      const bar = document.createElement('div');
+      bar.className = 'edit-actions';
+      bar.innerHTML = `
+        <button class="action-btn edit-confirm-btn" title="Confirm">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          <span class="tooltip">Confirm</span>
+        </button>
+        <button class="action-btn edit-cancel-btn" title="Cancel">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <span class="tooltip">Cancel</span>
+        </button>
+      `;
+      userMsgDiv.appendChild(bar);
+      userMsgDiv.querySelector('.message-actions').style.display = 'none';
+      textarea.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); bar.querySelector('.edit-confirm-btn').click(); }
+        if (ev.key === 'Escape') { bar.querySelector('.edit-cancel-btn').click(); }
+      });
       return;
     }
   });
@@ -1068,7 +1200,14 @@ document.addEventListener('DOMContentLoaded', () => {
       const cellCount = headerCells.length;
       const renderCells = (cells, tag) => {
         const padded = cells.concat(Array(Math.max(0, cellCount - cells.length)).fill(''));
-        return padded.slice(0, cellCount).map(c => `<${tag}>${c}</${tag}>`).join('');
+        return padded.slice(0, cellCount).map(c => {
+          // Render any math placeholders inside cells
+          const cellContent = c.replace(/%%MATH_BLOCK_(\d+)%%/g, (m, idx) => {
+            const block = mathBlocks[parseInt(idx)];
+            return block ? renderKaTeX(block.latex, block.display) : m;
+          });
+          return `<${tag}>${cellContent}</${tag}>`;
+        }).join('');
       };
 
       let tableHTML = '<table class="md-table">';

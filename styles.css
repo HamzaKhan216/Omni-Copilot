@@ -417,6 +417,29 @@ textarea:focus { border-color: var(--accent-color); }
   border: 1px solid var(--border-color);
 }
 
+/* Inline Edit */
+.edit-textarea {
+  width: 100%;
+  background: var(--bg-color);
+  color: var(--text-primary);
+  border: 1px solid var(--accent-color);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+  box-sizing: border-box;
+}
+.edit-textarea:focus { border-color: var(--accent-color); }
+.edit-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+
 /* Thinking Block Styles */
 .thinking-block {
   margin: 4px 0;
@@ -566,20 +589,17 @@ hr {
 }
 .md-table th,
 .md-table td {
-  border: 1px solid var(--border-color);
-  padding: 8px 12px;
+  padding: 6px 12px;
   text-align: left;
+  border-bottom: 1px solid var(--border-color);
 }
 .md-table th {
-  background-color: var(--panel-bg);
   font-weight: 600;
   color: var(--text-primary);
+  border-bottom: 2px solid var(--border-color);
 }
 .md-table td {
-  background-color: var(--ai-msg);
-}
-.md-table tr:hover td {
-  background-color: var(--border-color);
+  color: var(--text-secondary);
 }
 
 /* KaTeX Math Styling */
