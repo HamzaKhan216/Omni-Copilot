@@ -351,7 +351,9 @@ textarea:focus { border-color: var(--accent-color); }
 }
 #send-btn:active { transform: scale(0.95); }
 #send-btn:hover { background-color: var(--accent-hover); }
-#send-btn svg { fill: #0b1120; } /* Contrast icon color */
+#send-btn svg { fill: #0b1120; }
+#send-btn.streaming { background-color: #f04f67; }
+#send-btn.streaming:hover { background-color: #e0334a; }
 
 /* Image Preview Styles */
 #image-preview-container {
@@ -553,6 +555,31 @@ hr {
   border: none;
   border-top: 1px solid var(--border-color);
   margin: 16px 0;
+}
+
+/* Markdown Tables */
+.md-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 0.9em;
+}
+.md-table th,
+.md-table td {
+  border: 1px solid var(--border-color);
+  padding: 8px 12px;
+  text-align: left;
+}
+.md-table th {
+  background-color: var(--panel-bg);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.md-table td {
+  background-color: var(--ai-msg);
+}
+.md-table tr:hover td {
+  background-color: var(--border-color);
 }
 
 /* KaTeX Math Styling */

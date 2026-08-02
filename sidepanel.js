@@ -36,6 +36,8 @@ document.addEventListener('DOMContentLoaded', () => {
     chatContainer: document.getElementById('chat-container'),
     promptInput: document.getElementById('prompt-input'),
     sendBtn: document.getElementById('send-btn'),
+    sendIcon: document.getElementById('send-icon'),
+    stopIcon: document.getElementById('stop-icon'),
     readPageToggle: document.getElementById('read-page-toggle'),
     quickBtns: document.querySelectorAll('.quick-btn'),
     imagePreviewContainer: document.getElementById('image-preview-container'),
@@ -53,11 +55,13 @@ document.addEventListener('DOMContentLoaded', () => {
   let currentSessionId = null;
   let chatHistory = [];
   let pendingImages = [];
+  let isStreaming = false;
+  let currentAbortController = null;
 
   const defaultModels = {
-    openai: "gpt-4o", gemini: "gemini-1.5-pro-latest",
-    claude: "claude-3-haiku-20240307", groq: "llama3-8b-8192",
-    nvidia: "meta/llama3-70b-instruct"
+    openai: "gpt-4o", gemini: "gemini-3.6-flash",
+    claude: "claude-haiku-4-5-20251001", groq: "llama-3.1-8b-instant",
+    nvidia: "meta/llama-3.3-70b-instruct"
   };
 
   // --- MODEL FETCHING ---
@@ -537,6 +541,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (e.target.closest('.regenerate-btn')) {
+      if (isStreaming) return;
       if (!entry || !entry.responses) return;
       const aiMsgIdx = getMsgIndex(msgDiv);
       const allMsgs = [...elements.chatContainer.querySelectorAll('.message')];
@@ -553,21 +558,16 @@ document.addEventListener('DOMContentLoaded', () => {
       const textDiv = msgDiv.querySelector('.message-content');
       textDiv.innerHTML = `<div class="typing-indicator"><span></span><span></span><span></span></div>`;
 
+      currentAbortController = new AbortController();
+      updateSendButton(true);
+
       chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt'], async (settings) => {
-        if (!settings.apiKey) { textDiv.innerHTML = '⚠️ Please set your API key in Settings first.'; return; }
+        if (!settings.apiKey) { textDiv.innerHTML = '⚠️ Please set your API key in Settings first.'; updateSendButton(false); return; }
         let pageContext = "";
         if (elements.readPageToggle.checked) pageContext = await getPageContext();
         const promptWithContext = pageContext ? `Context from current webpage:\n\n${pageContext}\n\nUser Question: ${userText}` : userText;
         const tempHistory = chatHistory.slice(0, aiMsgIdx).concat([{ role: 'user', content: promptWithContext }]);
         try {
-          let lastScroll = 0;
-          const throttledScroll = () => {
-            const now = Date.now();
-            if (now - lastScroll > 100) {
-              lastScroll = now;
-              elements.chatContainer.scrollTo({ top: elements.chatContainer.scrollHeight });
-            }
-          };
           let thinkingGlow = null;
           const startGlow = () => {
             if (thinkingGlow) return;
@@ -590,10 +590,9 @@ document.addEventListener('DOMContentLoaded', () => {
             textDiv.innerHTML = parseMarkdown(partialText, true);
             renderMathIn(textDiv);
             startGlow();
-            throttledScroll();
           };
 
-          const response = await fetchAIResponse(settings.provider, settings.model || defaultModels[settings.provider], settings.apiKey, tempHistory, [], settings.systemPrompt, onToken);
+          const response = await fetchAIResponse(settings.provider, settings.model || defaultModels[settings.provider], settings.apiKey, tempHistory, [], settings.systemPrompt, onToken, currentAbortController.signal);
           stopGlow();
           entry.responses.push(response);
           entry.currentIndex = entry.responses.length - 1;
@@ -604,7 +603,25 @@ document.addEventListener('DOMContentLoaded', () => {
           updateResponseNav(msgDiv);
         } catch (error) {
           if (thinkingGlow) { clearInterval(thinkingGlow); thinkingGlow = null; }
-          textDiv.innerHTML = `❌ Error: ${error.message}`;
+          if (error.name === 'AbortError') {
+            const partialText = textDiv.innerText || '';
+            if (partialText) {
+              textDiv.innerHTML = parseMarkdown(partialText);
+              renderMathIn(textDiv);
+              entry.responses.push(partialText);
+              entry.currentIndex = entry.responses.length - 1;
+              entry.content = partialText;
+              saveSession();
+              updateResponseNav(msgDiv);
+            } else {
+              textDiv.innerHTML = '⚠️ Response stopped.';
+            }
+          } else {
+            textDiv.innerHTML = `❌ Error: ${error.message}`;
+          }
+        } finally {
+          currentAbortController = null;
+          updateSendButton(false);
         }
       });
       return;
@@ -624,7 +641,76 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  elements.chatContainer.addEventListener('click', (e) => {
+    const userMsgDiv = e.target.closest('.user-message');
+    if (!userMsgDiv) return;
+
+    if (e.target.closest('.user-copy-btn')) {
+      const text = userMsgDiv.querySelector('.message-content')?.innerText || '';
+      navigator.clipboard.writeText(text).then(() => {
+        const tooltip = e.target.closest('.user-copy-btn')?.querySelector('.tooltip');
+        if (tooltip) { tooltip.textContent = 'Copied!'; setTimeout(() => tooltip.textContent = 'Copy', 1500); }
+      });
+      return;
+    }
+
+    if (e.target.closest('.user-speak-btn')) {
+      const btn = e.target.closest('.user-speak-btn');
+      if (currentSpeech) {
+        speechSynthesis.cancel();
+        currentSpeech = null;
+        document.querySelectorAll('.read-aloud-btn.active, .user-speak-btn.active').forEach(b => b.classList.remove('active'));
+        if (btn.classList.contains('active')) return;
+      }
+      const text = userMsgDiv.querySelector('.message-content')?.innerText || '';
+      if (!text) return;
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.onend = () => { currentSpeech = null; document.querySelectorAll('.read-aloud-btn.active, .user-speak-btn.active').forEach(b => b.classList.remove('active')); };
+      currentSpeech = utter;
+      btn.classList.add('active');
+      speechSynthesis.speak(utter);
+      return;
+    }
+
+    if (e.target.closest('.user-edit-btn')) {
+      if (isStreaming) return;
+      const msgIndex = parseInt(userMsgDiv.getAttribute('data-index'));
+      if (isNaN(msgIndex)) return;
+      const entry = chatHistory[msgIndex];
+      if (!entry) return;
+      const rawText = entry.content.replace(/^Context from current webpage:\n\n[\s\S]+?\n\nUser Question:\s*/, '');
+      elements.promptInput.value = rawText;
+      elements.promptInput.style.height = 'auto';
+      elements.promptInput.style.height = (elements.promptInput.scrollHeight < 120 ? elements.promptInput.scrollHeight : 120) + 'px';
+      elements.promptInput.focus();
+      chatHistory.splice(msgIndex);
+      const msgs = [...elements.chatContainer.querySelectorAll('.message')];
+      for (let i = msgs.indexOf(userMsgDiv); i < msgs.length; i++) {
+        msgs[i].remove();
+      }
+      return;
+    }
+  });
+
+  function updateSendButton(streaming) {
+    isStreaming = streaming;
+    if (streaming) {
+      elements.sendBtn.classList.add('streaming');
+      elements.sendIcon.style.display = 'none';
+      elements.stopIcon.style.display = 'block';
+    } else {
+      elements.sendBtn.classList.remove('streaming');
+      elements.sendIcon.style.display = 'block';
+      elements.stopIcon.style.display = 'none';
+    }
+  }
+
   async function sendMessage() {
+    if (isStreaming) {
+      if (currentAbortController) currentAbortController.abort();
+      return;
+    }
+
     const text = elements.promptInput.value.trim();
     if (!text && pendingImages.length === 0) return;
 
@@ -657,16 +743,11 @@ document.addEventListener('DOMContentLoaded', () => {
       chatHistory.push({ role: 'user', content: promptWithContext });
       saveSession();
 
+      currentAbortController = new AbortController();
+      updateSendButton(true);
+
       try {
         const contentDiv = aiMessageDiv.querySelector('.message-content');
-        let lastScroll = 0;
-        const throttledScroll = () => {
-          const now = Date.now();
-          if (now - lastScroll > 100) {
-            lastScroll = now;
-            elements.chatContainer.scrollTo({ top: elements.chatContainer.scrollHeight });
-          }
-        };
         let thinkingGlow = null;
         const startGlow = () => {
           if (thinkingGlow) return;
@@ -689,13 +770,12 @@ document.addEventListener('DOMContentLoaded', () => {
           contentDiv.innerHTML = parseMarkdown(partialText, true);
           renderMathIn(contentDiv);
           startGlow();
-          throttledScroll();
         };
 
         const response = await fetchAIResponse(
           settings.provider, settings.model || defaultModels[settings.provider],
           settings.apiKey, chatHistory, imagesToSend, settings.systemPrompt,
-          onToken
+          onToken, currentAbortController.signal
         );
 
         stopGlow();
@@ -732,16 +812,44 @@ document.addEventListener('DOMContentLoaded', () => {
         aiMessageDiv.appendChild(actionsDiv);
       } catch (error) {
         if (thinkingGlow) { clearInterval(thinkingGlow); thinkingGlow = null; }
-        aiMessageDiv.querySelector('.message-content').innerHTML = `❌ Error: ${error.message}`;
-        chatHistory.pop();
+        if (error.name === 'AbortError') {
+          const contentDiv = aiMessageDiv.querySelector('.message-content');
+          const partialText = contentDiv.innerText || '';
+          if (partialText) {
+            contentDiv.innerHTML = parseMarkdown(partialText);
+            renderMathIn(contentDiv);
+            chatHistory.push({ role: 'assistant', content: partialText, responses: [partialText], currentIndex: 0 });
+            saveSession();
+            const actionsDiv = document.createElement('div');
+            actionsDiv.className = 'message-actions';
+            actionsDiv.innerHTML = `
+              <button class="action-btn copy-msg-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span class="tooltip">Copy</span></button>
+              <button class="action-btn read-aloud-btn" title="Read aloud"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span class="tooltip">Read aloud</span></button>
+              <button class="action-btn regenerate-btn" title="Regenerate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg><span class="tooltip">Regenerate</span></button>
+              <div class="response-nav" style="display:none;"><button class="resp-prev" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg></button><span class="resp-counter">1/1</span><button class="resp-next" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></button></div>
+            `;
+            aiMessageDiv.appendChild(actionsDiv);
+          } else {
+            contentDiv.innerHTML = '⚠️ Response stopped.';
+            chatHistory.pop();
+          }
+        } else {
+          aiMessageDiv.querySelector('.message-content').innerHTML = `❌ Error: ${error.message}`;
+          chatHistory.pop();
+        }
+      } finally {
+        currentAbortController = null;
+        updateSendButton(false);
       }
-      elements.chatContainer.scrollTo({ top: elements.chatContainer.scrollHeight, behavior: 'smooth' });
     });
   }
 
   function appendMessage(sender, text, className, isHTML, images = []) {
     const div = document.createElement('div');
     div.className = `message ${className}`;
+    if (className === 'user-message') {
+      div.setAttribute('data-index', chatHistory.length);
+    }
 
     if (images.length > 0) {
       const imgContainer = document.createElement('div');
@@ -786,6 +894,26 @@ document.addEventListener('DOMContentLoaded', () => {
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
           </button>
         </div>
+      `;
+      div.appendChild(actionsDiv);
+    }
+
+    if (className === 'user-message' && !isHTML) {
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'message-actions';
+      actionsDiv.innerHTML = `
+        <button class="action-btn user-copy-btn" title="Copy">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          <span class="tooltip">Copy</span>
+        </button>
+        <button class="action-btn user-speak-btn" title="Read aloud">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+          <span class="tooltip">Read aloud</span>
+        </button>
+        <button class="action-btn user-edit-btn" title="Edit">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          <span class="tooltip">Edit</span>
+        </button>
       `;
       div.appendChild(actionsDiv);
     }
@@ -847,6 +975,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function parseMarkdown(text, streaming = false) {
     const codeBlocks =[];
     const mathBlocks = [];
+    const tableBlocks = [];
 
     // 0. Handle Thinking Process (Reasoning)
     if (streaming) {
@@ -916,6 +1045,51 @@ document.addEventListener('DOMContentLoaded', () => {
       return `%%%CODE_BLOCK_${codeBlocks.length - 1}%%%`;
     });
 
+    // 1.5. Extract Tables (before \n -> <br/> breaks them)
+    text = text.replace(/(?:^|\n)((?:\|.+\|\n?)+)/g, (match, tableBlock) => {
+      const rows = tableBlock.trim().split('\n').filter(r => r.trim());
+      if (rows.length < 2) return match;
+
+      const parseRow = (row) => row.split('|').slice(1, -1).map(c => c.trim());
+      const headerCells = parseRow(rows[0]);
+      if (headerCells.length === 0) return match;
+
+      const isSeparator = (row) => /^\|[\s:-]+\|[\s:-]+\|$/.test(row.trim());
+      let bodyRows, hasHeader;
+
+      if (rows.length >= 3 && isSeparator(rows[1])) {
+        hasHeader = true;
+        bodyRows = rows.slice(2).filter(r => !isSeparator(r));
+      } else {
+        hasHeader = false;
+        bodyRows = rows.slice(1);
+      }
+
+      const cellCount = headerCells.length;
+      const renderCells = (cells, tag) => {
+        const padded = cells.concat(Array(Math.max(0, cellCount - cells.length)).fill(''));
+        return padded.slice(0, cellCount).map(c => `<${tag}>${c}</${tag}>`).join('');
+      };
+
+      let tableHTML = '<table class="md-table">';
+      if (hasHeader) {
+        tableHTML += `<thead><tr>${renderCells(headerCells, 'th')}</tr></thead>`;
+      }
+      if (bodyRows.length > 0) {
+        tableHTML += '<tbody>';
+        bodyRows.forEach(row => {
+          const cells = parseRow(row);
+          tableHTML += `<tr>${renderCells(cells, 'td')}</tr>`;
+        });
+        tableHTML += '</tbody>';
+      }
+      tableHTML += '</table>';
+
+      const id = `%%TABLE_BLOCK_${tableBlocks.length}%%`;
+      tableBlocks.push(tableHTML);
+      return '\n' + id + '\n';
+    });
+
     // 2. Format basic elements
     let html = text
       .replace(/^### (.*$)/gim, '<h3>$1</h3>') 
@@ -950,6 +1124,11 @@ document.addEventListener('DOMContentLoaded', () => {
     html = html.replace(/%%MATH_BLOCK_(\d+)%%/g, (match, index) => {
       const block = mathBlocks[index];
       return renderKaTeX(block.latex, block.display);
+    });
+
+    // 4.5. Restore Table Blocks
+    html = html.replace(/%%TABLE_BLOCK_(\d+)%%/g, (match, index) => {
+      return tableBlocks[index];
     });
 
     // 5. Restore Code Blocks with the Beautiful UI
@@ -997,7 +1176,7 @@ document.addEventListener('DOMContentLoaded', () => {
     return result || "";
   }
 
-  async function fetchAIResponse(provider, model, apiKey, messages, pendingImages = [], customSystemPrompt = "", onToken = null) {
+  async function fetchAIResponse(provider, model, apiKey, messages, pendingImages = [], customSystemPrompt = "", onToken = null, signal = null) {
     let url, headers, body;
     const streaming = !!onToken;
 
@@ -1058,7 +1237,7 @@ document.addEventListener('DOMContentLoaded', () => {
       body = JSON.stringify(requestBody);
     }
 
-    const response = await fetch(url, { method: "POST", headers, body });
+    const response = await fetch(url, { method: "POST", headers, body, signal });
     if (!response.ok) {
       const errData = await response.json();
       throw new Error(errData.error?.message || errData.error || "Failed to fetch response");

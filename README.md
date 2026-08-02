@@ -20,10 +20,10 @@ Designed for peak productivity without the bloat, Omni-Copilot allows you to sea
 * **🌐 Universal Webpage Context:** Omni-Copilot can intelligently read the active tab. Highlight specific text, or let our smart DOM extractor bypass noisy headers and footers to fetch the core content of the page for the AI to analyze.
 * **🧠 Multi-Model Support:** Plug in your API keys and instantly use:
   * `OpenAI` (GPT-4o)
-  * `Anthropic` (Claude 3 Opus/Sonnet/Haiku)
-  * `Google` (Gemini 1.5 Pro)
-  * `Groq` (Llama 3, Mixtral)
-  * `Nvidia NIM` (Meta Llama 3 70b)
+  * `Anthropic` (Claude 4 Opus/Sonnet/Haiku)
+  * `Google` (gemini-3.6-flash)
+  * `Groq` (Llama 3.3, Mixtral)
+  * `Nvidia NIM` (Meta Llama 3.3 70b)
 * **📸 Multimodal Capabilities:** Paste images directly into the chat prompt to have vision-capable models analyze them alongside your text.
 * **⚡ Keyboard Shortcuts & Quick Actions:** Hit `Ctrl+Shift+E` (or `Cmd+Shift+E`) to instantly open the side panel anywhere. Use one-click buttons to summarize or extract key takeaways.
 * **📝 Custom System Prompts:** Tailor the AI's persona and output formatting natively through the settings panel to fit your unique workflow.
