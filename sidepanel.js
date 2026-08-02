@@ -57,6 +57,8 @@ document.addEventListener('DOMContentLoaded', () => {
   let pendingImages = [];
   let isStreaming = false;
   let currentAbortController = null;
+  let lastSentPageUrl = null;
+  let lastSentPageContext = null;
 
   const defaultModels = {
     openai: "gpt-4o", gemini: "gemini-3.6-flash",
@@ -252,6 +254,8 @@ document.addEventListener('DOMContentLoaded', () => {
   function createSession() {
     currentSessionId = 'session_' + Date.now();
     chatHistory = [];
+    lastSentPageUrl = null;
+    lastSentPageContext = null;
     elements.chatContainer.innerHTML = '';
     const greetingDiv = appendMessage('AI', "Hello! I'm your Omni-Copilot. How can I help you today?", 'ai-message', true);
     renderMathIn(greetingDiv);
@@ -564,7 +568,20 @@ document.addEventListener('DOMContentLoaded', () => {
       chrome.storage.local.get(['provider', 'model', 'apiKey', 'systemPrompt'], async (settings) => {
         if (!settings.apiKey) { textDiv.innerHTML = '⚠️ Please set your API key in Settings first.'; updateSendButton(false); return; }
         let pageContext = "";
-        if (elements.readPageToggle.checked) pageContext = await getPageContext();
+        if (elements.readPageToggle.checked) {
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          const currentUrl = tab ? tab.url : null;
+          const newPageContext = await getPageContext();
+
+          const urlChanged = currentUrl !== lastSentPageUrl;
+          const contentChanged = newPageContext !== lastSentPageContext;
+
+          if (urlChanged || contentChanged) {
+            pageContext = newPageContext;
+            lastSentPageUrl = currentUrl;
+            lastSentPageContext = newPageContext;
+          }
+        }
         const promptWithContext = pageContext ? `Context from current webpage:\n\n${pageContext}\n\nUser Question: ${userText}` : userText;
         const tempHistory = chatHistory.slice(0, aiMsgIdx).concat([{ role: 'user', content: promptWithContext }]);
         try {
@@ -866,7 +883,20 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
       let pageContext = "";
-      if (elements.readPageToggle.checked) pageContext = await getPageContext();
+      if (elements.readPageToggle.checked) {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const currentUrl = tab ? tab.url : null;
+        const newPageContext = await getPageContext();
+
+        const urlChanged = currentUrl !== lastSentPageUrl;
+        const contentChanged = newPageContext !== lastSentPageContext;
+
+        if (chatHistory.length === 0 || urlChanged || contentChanged) {
+          pageContext = newPageContext;
+          lastSentPageUrl = currentUrl;
+          lastSentPageContext = newPageContext;
+        }
+      }
 
       const promptWithContext = pageContext
         ? `Context from current webpage:\n\n${pageContext}\n\nUser Question: ${text}`
