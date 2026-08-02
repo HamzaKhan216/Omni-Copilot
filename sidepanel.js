@@ -1201,8 +1201,12 @@ document.addEventListener('DOMContentLoaded', () => {
       const renderCells = (cells, tag) => {
         const padded = cells.concat(Array(Math.max(0, cellCount - cells.length)).fill(''));
         return padded.slice(0, cellCount).map(c => {
+          // Apply basic markdown to cell content
+          let cellContent = c
+            .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+            .replace(/\*([^*]+)\*/g, '<em>$1</em>');
           // Render any math placeholders inside cells
-          const cellContent = c.replace(/%%MATH_BLOCK_(\d+)%%/g, (m, idx) => {
+          cellContent = cellContent.replace(/%%MATH_BLOCK_(\d+)%%/g, (m, idx) => {
             const block = mathBlocks[parseInt(idx)];
             return block ? renderKaTeX(block.latex, block.display) : m;
           });
