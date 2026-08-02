@@ -472,7 +472,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let currentSpeech = null;
 
   function getMsgIndex(msgDiv) {
-    const msgs = [...elements.chatContainer.querySelectorAll('.ai-message')];
+    const msgs = [...elements.chatContainer.querySelectorAll('.message')];
     return msgs.indexOf(msgDiv);
   }
 
